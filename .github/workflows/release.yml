@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binary
+        run: |
+          swift build -c release --arch arm64
+          swift build -c release --arch x86_64
+          lipo -create -output ax-recorder \
+            .build/arm64-apple-macosx/release/ax-recorder \
+            .build/x86_64-apple-macosx/release/ax-recorder
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist
+          cp ax-recorder dist/
+          cd dist
+          tar -czf ax-recorder-macos.tar.gz ax-recorder
+          shasum -a 256 ax-recorder-macos.tar.gz > ax-recorder-macos.tar.gz.sha256
+          echo "SHA256=$(cat ax-recorder-macos.tar.gz.sha256 | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ax-recorder-macos.tar.gz
+            dist/ax-recorder-macos.tar.gz.sha256
+          body: |
+            ## ax-recorder ${{ github.ref_name }}
+
+            Universal binary (Apple Silicon + Intel).
+
+            ### Install via Homebrew
+            ```bash
+            brew tap YOUR_GITHUB_USERNAME/ax-recorder
+            brew install ax-recorder
+            ```
+
+            ### SHA256
+            `${{ env.SHA256 }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew formula SHA256
+        run: |
+          SHA=$(cat dist/ax-recorder-macos.tar.gz.sha256 | awk '{print $1}')
+          VERSION=${{ github.ref_name }}
+          sed -i '' "s/sha256 \".*\"/sha256 \"$SHA\"/" Formula/ax-recorder.rb
+          sed -i '' "s|/releases/download/v[^/]*/|/releases/download/$VERSION/|" Formula/ax-recorder.rb
+
+      - name: Commit updated formula
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update formula for ${{ github.ref_name }}"
+          file_pattern: Formula/ax-recorder.rb
