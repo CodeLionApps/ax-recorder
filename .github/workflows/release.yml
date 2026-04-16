@@ -64,5 +64,6 @@ jobs:
       - name: Commit updated formula
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
+          branch: main
           commit_message: "chore: update formula for ${{ github.ref_name }}"
           file_pattern: Formula/ax-recorder.rb
