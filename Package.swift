@@ -9,7 +9,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ax-recorder",
-            path: "Sources/ax-recorder",
+            path: "Sources/AXRecorder",
             linkerSettings: [
                 .linkedFramework("Cocoa"),
                 .linkedFramework("ApplicationServices"),

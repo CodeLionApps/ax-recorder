@@ -4,3 +4,4 @@
 *.d
 dist/
 ax-recorder
+.build
