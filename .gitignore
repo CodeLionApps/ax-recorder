@@ -3,6 +3,6 @@
 *.o
 *.d
 dist/
-ax-recorder
+/ax-recorder
 .build
 .cache
