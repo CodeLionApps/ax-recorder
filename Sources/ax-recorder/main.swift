@@ -13,6 +13,34 @@ var eventLog: [[String: String]] = []
 var observer: AXObserver?
 let axPressedNotification = "AXPressed"
 let axScrolledToVisibleNotification = "AXScrolledToVisible"
+let maxInitialTraversalDepth = 24
+let maxInitialTraversalNodes = 6_000
+
+let notificationsToWatch: [String] = [
+    axPressedNotification,
+    kAXFocusedUIElementChangedNotification as String,
+    kAXValueChangedNotification as String,
+    kAXSelectedTextChangedNotification as String,
+    kAXMenuItemSelectedNotification as String,
+    axScrolledToVisibleNotification,
+]
+
+let arrayAttributesToTraverse: [String] = [
+    kAXChildrenAttribute as String,
+    kAXVisibleChildrenAttribute as String,
+    kAXWindowsAttribute as String,
+    "AXContents",
+]
+
+let singleAttributesToTraverse: [String] = [
+    kAXMainWindowAttribute as String,
+    kAXFocusedWindowAttribute as String,
+    kAXFocusedUIElementAttribute as String,
+]
+
+var subscribedNotificationKeys = Set<String>()
+var seenElements = Set<Int>()
+var registrationErrors: [String: Int] = [:]
 
 // MARK: - Helpers
 
@@ -20,12 +48,16 @@ func timestamp() -> String {
     dateFormatter.string(from: Date())
 }
 
-func getAttr(_ element: AXUIElement, _ attr: String) -> String? {
+func copyAttr(_ element: AXUIElement, _ attr: String) -> CFTypeRef? {
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(element, attr as CFString, &value) == .success else {
         return nil
     }
-    return value as? String
+    return value
+}
+
+func getAttr(_ element: AXUIElement, _ attr: String) -> String? {
+    copyAttr(element, attr) as? String
 }
 
 func getIdentifier(_ element: AXUIElement) -> String {
@@ -46,6 +78,86 @@ func getLabel(_ element: AXUIElement) -> String {
         ?? getAttr(element, kAXTitleAttribute)
         ?? getAttr(element, kAXValueAttribute)
         ?? ""
+}
+
+func elementHash(_ element: AXUIElement) -> Int {
+    Int(CFHash(element))
+}
+
+func registrationErrorKey(_ error: AXError) -> String {
+    switch error {
+    case .apiDisabled:
+        return "apiDisabled"
+    case .cannotComplete:
+        return "cannotComplete"
+    case .invalidUIElement:
+        return "invalidUIElement"
+    case .invalidUIElementObserver:
+        return "invalidObserver"
+    case .notificationUnsupported:
+        return "notificationUnsupported"
+    case .notificationAlreadyRegistered:
+        return "alreadyRegistered"
+    default:
+        return "axError(\(error.rawValue))"
+    }
+}
+
+func addNotification(_ observer: AXObserver, _ element: AXUIElement, _ notification: String) -> Bool {
+    let key = "\(elementHash(element))::\(notification)"
+    guard !subscribedNotificationKeys.contains(key) else { return false }
+
+    let result = AXObserverAddNotification(observer, element, notification as CFString, nil)
+    switch result {
+    case .success:
+        subscribedNotificationKeys.insert(key)
+        return true
+    case .notificationAlreadyRegistered:
+        subscribedNotificationKeys.insert(key)
+        return false
+    case .notificationUnsupported:
+        return false
+    default:
+        let errKey = registrationErrorKey(result)
+        registrationErrors[errKey, default: 0] += 1
+        return false
+    }
+}
+
+func isAXUIElementRef(_ value: CFTypeRef) -> Bool {
+    CFGetTypeID(value) == AXUIElementGetTypeID()
+}
+
+func extractElements(from value: CFTypeRef) -> [AXUIElement] {
+    if isAXUIElementRef(value) {
+        return [unsafeBitCast(value, to: AXUIElement.self)]
+    }
+
+    guard let values = value as? [AnyObject] else { return [] }
+    var result: [AXUIElement] = []
+    for item in values {
+        let ref = item as CFTypeRef
+        if isAXUIElementRef(ref) {
+            result.append(unsafeBitCast(ref, to: AXUIElement.self))
+        }
+    }
+    return result
+}
+
+func relatedElements(of element: AXUIElement) -> [AXUIElement] {
+    var result: [AXUIElement] = []
+
+    for attr in arrayAttributesToTraverse {
+        guard let value = copyAttr(element, attr) else { continue }
+        result.append(contentsOf: extractElements(from: value))
+    }
+
+    for attr in singleAttributesToTraverse {
+        guard let value = copyAttr(element, attr) else { continue }
+        result.append(contentsOf: extractElements(from: value))
+    }
+
+    return result
 }
 
 // MARK: - Event callback
@@ -83,6 +195,17 @@ let axCallback: AXObserverCallback = { _, element, notification, _ in
         "role": role,
         "label": label,
     ])
+
+    // Simulator dynamicznie podmienia poddrzewa AX. Doprofiluj subskrypcje
+    // po każdym realnym zdarzeniu, żeby nie zgubić dalszych eventów.
+    if let obs = observer {
+        _ = addNotification(obs, element, axPressedNotification)
+        _ = addNotification(obs, element, kAXValueChangedNotification as String)
+        for related in relatedElements(of: element) {
+            _ = addNotification(obs, related, axPressedNotification)
+            _ = addNotification(obs, related, kAXValueChangedNotification as String)
+        }
+    }
 }
 
 // MARK: - Simulator discovery
@@ -104,29 +227,41 @@ func findSimulator(named hint: String? = nil) -> NSRunningApplication? {
 
 // MARK: - Subscribe to events
 
-let notificationsToWatch = [
-    axPressedNotification,
-    kAXFocusedUIElementChangedNotification,
-    kAXValueChangedNotification,
-    kAXSelectedTextChangedNotification,
-    kAXMenuItemSelectedNotification,
-    axScrolledToVisibleNotification,
-]
+@discardableResult
+func subscribeRecursively(
+    _ observer: AXObserver,
+    _ root: AXUIElement,
+    maxDepth: Int = maxInitialTraversalDepth,
+    maxNodes: Int = maxInitialTraversalNodes
+) -> (visited: Int, added: Int) {
+    var queue: [(AXUIElement, Int)] = [(root, 0)]
+    var localVisited = 0
+    var localAdded = 0
 
-func subscribeRecursively(_ observer: AXObserver, _ element: AXUIElement, depth: Int = 0) {
-    guard depth < 10 else { return }
+    while !queue.isEmpty && localVisited < maxNodes {
+        let (element, depth) = queue.removeFirst()
+        let elementID = elementHash(element)
+        if seenElements.contains(elementID) && depth > 0 {
+            continue
+        }
 
-    for notif in notificationsToWatch {
-        AXObserverAddNotification(observer, element, notif as CFString, nil)
+        seenElements.insert(elementID)
+        localVisited += 1
+
+        for notif in notificationsToWatch {
+            if addNotification(observer, element, notif) {
+                localAdded += 1
+            }
+        }
+
+        guard depth < maxDepth else { continue }
+        let next = relatedElements(of: element)
+        for child in next {
+            queue.append((child, depth + 1))
+        }
     }
 
-    var childrenRef: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef) == .success,
-          let children = childrenRef as? [AXUIElement] else { return }
-
-    for child in children {
-        subscribeRecursively(observer, child, depth: depth + 1)
-    }
+    return (localVisited, localAdded)
 }
 
 // MARK: - JSON export
@@ -212,25 +347,54 @@ print("🎯  Podpięto pod Simulator (PID \(simApp.processIdentifier))")
 print("📋  Nagrywanie eventów... (Ctrl+C żeby zakończyć)\n")
 
 // Sprawdź uprawnienia Accessibility
-let trusted = AXIsProcessTrusted()
+let trustOpts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+let trusted = AXIsProcessTrustedWithOptions(trustOpts)
 if !trusted {
-    print("⚠️  Brak uprawnień Accessibility!")
+    print("❌  Brak uprawnień Accessibility!")
     print("   Przejdź do: System Settings → Privacy & Security → Accessibility")
-    print("   i dodaj Terminal (lub iTerm2).\n")
+    print("   i dodaj Terminal (lub iTerm2), potem uruchom ponownie.\n")
+    exit(1)
 }
 
 // Utwórz observer
 let pid = simApp.processIdentifier
 let appElement = AXUIElementCreateApplication(pid)
 
-AXObserverCreate(pid, axCallback, &observer)
+let observerCreateResult = AXObserverCreate(pid, axCallback, &observer)
+if observerCreateResult != .success {
+    print("❌  Nie udało się utworzyć AXObserver: \(registrationErrorKey(observerCreateResult))")
+    exit(1)
+}
+
 guard let obs = observer else {
     print("❌  Nie udało się utworzyć AXObserver")
     exit(1)
 }
 
-subscribeRecursively(obs, appElement)
+let initial = subscribeRecursively(obs, appElement)
+print("🔎  AX init: odwiedzono \(initial.visited) elementów, aktywnych subskrypcji: \(initial.added)")
+if initial.added == 0 {
+    print("⚠️  Nie udało się zarejestrować żadnej subskrypcji AX.")
+}
+if !registrationErrors.isEmpty {
+    let summary = registrationErrors
+        .sorted { $0.value > $1.value }
+        .map { "\($0.key)=\($0.value)" }
+        .joined(separator: ", ")
+    print("ℹ️  Rejestracja AX (diag): \(summary)")
+}
+
 CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs), .defaultMode)
+
+// Simulator często dynamicznie tworzy/podmienia poddrzewa AX.
+// Okresowe dosubskrybowanie zapobiega "ciszy" po zmianie widoku.
+Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+    let rescan = subscribeRecursively(obs, appElement, maxDepth: 8, maxNodes: 1_500)
+    if rescan.added > 0 {
+        print("🔁  AX rescan: +\(rescan.added) nowych subskrypcji")
+        fflush(stdout)
+    }
+}
 
 // Obsługa Ctrl+C
 signal(SIGINT) { _ in
