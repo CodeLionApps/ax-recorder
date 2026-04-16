@@ -15,6 +15,8 @@ let axPressedNotification = "AXPressed"
 let axScrolledToVisibleNotification = "AXScrolledToVisible"
 let maxInitialTraversalDepth = 24
 let maxInitialTraversalNodes = 6_000
+let fallbackPollInterval: TimeInterval = 0.08
+let duplicateEventWindow: TimeInterval = 0.12
 
 let notificationsToWatch: [String] = [
     axPressedNotification,
@@ -41,6 +43,11 @@ let singleAttributesToTraverse: [String] = [
 var subscribedNotificationKeys = Set<String>()
 var seenElements = Set<Int>()
 var registrationErrors: [String: Int] = [:]
+var lastEventSignature: String?
+var lastEventTimestamp = Date.distantPast
+var leftMouseWasDown = false
+var lastPolledFocusHash: Int?
+var lastPolledValueByElementHash: [Int: String] = [:]
 
 // MARK: - Helpers
 
@@ -54,6 +61,11 @@ func copyAttr(_ element: AXUIElement, _ attr: String) -> CFTypeRef? {
         return nil
     }
     return value
+}
+
+func getAXElement(_ element: AXUIElement, _ attr: String) -> AXUIElement? {
+    guard let value = copyAttr(element, attr) else { return nil }
+    return extractElements(from: value).first
 }
 
 func getAttr(_ element: AXUIElement, _ attr: String) -> String? {
@@ -82,6 +94,79 @@ func getLabel(_ element: AXUIElement) -> String {
 
 func elementHash(_ element: AXUIElement) -> Int {
     Int(CFHash(element))
+}
+
+func getCGPointAttr(_ element: AXUIElement, _ attr: String) -> CGPoint? {
+    guard let value = copyAttr(element, attr) else { return nil }
+    guard CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    var point = CGPoint.zero
+    let ok = AXValueGetValue(value as! AXValue, .cgPoint, &point)
+    return ok ? point : nil
+}
+
+func getCGSizeAttr(_ element: AXUIElement, _ attr: String) -> CGSize? {
+    guard let value = copyAttr(element, attr) else { return nil }
+    guard CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    var size = CGSize.zero
+    let ok = AXValueGetValue(value as! AXValue, .cgSize, &size)
+    return ok ? size : nil
+}
+
+func getWindowFrame(_ windowElement: AXUIElement) -> CGRect? {
+    guard let origin = getCGPointAttr(windowElement, kAXPositionAttribute),
+          let size = getCGSizeAttr(windowElement, kAXSizeAttribute) else {
+        return nil
+    }
+    return CGRect(origin: origin, size: size)
+}
+
+func getCurrentWindow(_ appElement: AXUIElement) -> AXUIElement? {
+    getAXElement(appElement, kAXFocusedWindowAttribute)
+        ?? getAXElement(appElement, kAXMainWindowAttribute)
+}
+
+func isPointInsideSimulatorWindow(_ point: CGPoint, appElement: AXUIElement) -> Bool {
+    guard let window = getCurrentWindow(appElement),
+          let frame = getWindowFrame(window) else {
+        return false
+    }
+    return frame.contains(point)
+}
+
+func axPointCandidates(from point: CGPoint) -> [CGPoint] {
+    let maxScreenY = NSScreen.screens.map(\.frame.maxY).max() ?? 0
+    let flipped = CGPoint(x: point.x, y: maxScreenY - point.y)
+    if abs(flipped.y - point.y) < 0.01 {
+        return [point]
+    }
+    return [point, flipped]
+}
+
+func elementAtPoint(_ appElement: AXUIElement, _ point: CGPoint) -> AXUIElement? {
+    for candidate in axPointCandidates(from: point) {
+        var hitElement: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(
+            appElement,
+            Float(candidate.x),
+            Float(candidate.y),
+            &hitElement
+        )
+        if result == .success, let hitElement {
+            return hitElement
+        }
+    }
+    return nil
+}
+
+func shouldDropAsDuplicate(_ signature: String) -> Bool {
+    let now = Date()
+    if lastEventSignature == signature,
+       now.timeIntervalSince(lastEventTimestamp) < duplicateEventWindow {
+        return true
+    }
+    lastEventSignature = signature
+    lastEventTimestamp = now
+    return false
 }
 
 func registrationErrorKey(_ error: AXError) -> String {
@@ -160,26 +245,13 @@ func relatedElements(of element: AXUIElement) -> [AXUIElement] {
     return result
 }
 
-// MARK: - Event callback
-
-let axCallback: AXObserverCallback = { _, element, notification, _ in
-    let notif = notification as String
-
-    let actionMap: [String: String] = [
-        axPressedNotification:          "tap",
-        kAXFocusedUIElementChangedNotification: "focus",
-        kAXValueChangedNotification:     "valueChanged",
-        kAXSelectedTextChangedNotification: "textChanged",
-        kAXMenuItemSelectedNotification: "menuSelect",
-        axScrolledToVisibleNotification: "scroll",
-    ]
-
-    guard let action = actionMap[notif] else { return }
-
-    let id    = getIdentifier(element)
-    let role  = getRole(element)
+func logEvent(action: String, element: AXUIElement) {
+    let id = getIdentifier(element)
+    let role = getRole(element)
     let label = getLabel(element)
-    let ts    = timestamp()
+    let ts = timestamp()
+    let signature = "\(action)|\(id)|\(role)|\(label)"
+    if shouldDropAsDuplicate(signature) { return }
 
     var parts = ["\(ts)  [\(action)]  id=\(id)  role=\(role)"]
     if !label.isEmpty { parts.append("label=\"\(label)\"") }
@@ -206,6 +278,24 @@ let axCallback: AXObserverCallback = { _, element, notification, _ in
             _ = addNotification(obs, related, kAXValueChangedNotification as String)
         }
     }
+}
+
+// MARK: - Event callback
+
+let axCallback: AXObserverCallback = { _, element, notification, _ in
+    let notif = notification as String
+
+    let actionMap: [String: String] = [
+        axPressedNotification:          "tap",
+        kAXFocusedUIElementChangedNotification: "focus",
+        kAXValueChangedNotification:     "valueChanged",
+        kAXSelectedTextChangedNotification: "textChanged",
+        kAXMenuItemSelectedNotification: "menuSelect",
+        axScrolledToVisibleNotification: "scroll",
+    ]
+
+    guard let action = actionMap[notif] else { return }
+    logEvent(action: action, element: element)
 }
 
 // MARK: - Simulator discovery
@@ -262,6 +352,41 @@ func subscribeRecursively(
     }
 
     return (localVisited, localAdded)
+}
+
+func pollFallbackEvents(simulatorPID: pid_t, appElement: AXUIElement) {
+    // Kliknięcia: fallback, gdy AXPressed z Simulatora nie przychodzi.
+    let leftMouseDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+    let simulatorFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == simulatorPID
+
+    if leftMouseDown && !leftMouseWasDown && simulatorFrontmost {
+        let mouse = NSEvent.mouseLocation
+        if isPointInsideSimulatorWindow(mouse, appElement: appElement) {
+            if let hit = elementAtPoint(appElement, mouse) {
+                logEvent(action: "tap", element: hit)
+            } else if let window = getCurrentWindow(appElement) {
+                logEvent(action: "tap", element: window)
+            }
+        }
+    }
+    leftMouseWasDown = leftMouseDown
+
+    // Fokus/wartość: fallback, gdy notyfikacje fokusu i valueChange się gubią.
+    if let focused = getAXElement(appElement, kAXFocusedUIElementAttribute) {
+        let currentHash = elementHash(focused)
+        if lastPolledFocusHash != currentHash {
+            lastPolledFocusHash = currentHash
+            logEvent(action: "focus", element: focused)
+        }
+
+        if let currentValue = getAttr(focused, kAXValueAttribute) {
+            let previousValue = lastPolledValueByElementHash[currentHash]
+            if let previousValue, previousValue != currentValue {
+                logEvent(action: "valueChanged", element: focused)
+            }
+            lastPolledValueByElementHash[currentHash] = currentValue
+        }
+    }
 }
 
 // MARK: - JSON export
@@ -394,6 +519,11 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
         print("🔁  AX rescan: +\(rescan.added) nowych subskrypcji")
         fflush(stdout)
     }
+}
+
+// Fallback polling gdy Simulator nie emituje pełnego strumienia notyfikacji AX.
+Timer.scheduledTimer(withTimeInterval: fallbackPollInterval, repeats: true) { _ in
+    pollFallbackEvents(simulatorPID: pid, appElement: appElement)
 }
 
 // Obsługa Ctrl+C
