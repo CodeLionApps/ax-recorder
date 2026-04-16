@@ -17,6 +17,8 @@ let maxInitialTraversalDepth = 24
 let maxInitialTraversalNodes = 6_000
 let fallbackPollInterval: TimeInterval = 0.08
 let duplicateEventWindow: TimeInterval = 0.12
+let genericRoles: Set<String> = ["AXGroup", "AXUnknown", "AXLayoutArea", "AXSplitGroup"]
+let debugMode = ProcessInfo.processInfo.environment["AX_RECORDER_DEBUG"] == "1"
 
 let notificationsToWatch: [String] = [
     axPressedNotification,
@@ -45,14 +47,25 @@ var seenElements = Set<Int>()
 var registrationErrors: [String: Int] = [:]
 var lastEventSignature: String?
 var lastEventTimestamp = Date.distantPast
-var leftMouseWasDown = false
 var lastPolledFocusHash: Int?
 var lastPolledValueByElementHash: [Int: String] = [:]
+var fallbackLeftMouseWasDown = false
+var fallbackTapSimulatorPID: pid_t = 0
+var fallbackTapAppElement: AXUIElement?
+var fallbackTapSystemWideElement: AXUIElement?
+var clickEventTap: CFMachPort?
+var clickEventTapSource: CFRunLoopSource?
 
 // MARK: - Helpers
 
 func timestamp() -> String {
     dateFormatter.string(from: Date())
+}
+
+func debugLog(_ message: String) {
+    guard debugMode else { return }
+    print("🐞  \(message)")
+    fflush(stdout)
 }
 
 func copyAttr(_ element: AXUIElement, _ attr: String) -> CFTypeRef? {
@@ -72,11 +85,16 @@ func getAttr(_ element: AXUIElement, _ attr: String) -> String? {
     copyAttr(element, attr) as? String
 }
 
+func readIdentifierLikeValue(_ element: AXUIElement) -> String? {
+    if let id = getAttr(element, kAXIdentifierAttribute), !id.isEmpty { return id }
+    if let label = getAttr(element, kAXDescriptionAttribute), !label.isEmpty { return "label:\(label)" }
+    if let title = getAttr(element, kAXTitleAttribute), !title.isEmpty { return "title:\(title)" }
+    if let value = getAttr(element, kAXValueAttribute), !value.isEmpty { return "value:\(value)" }
+    return nil
+}
+
 func getIdentifier(_ element: AXUIElement) -> String {
-    if let id = getAttr(element, kAXIdentifierAttribute) { return id }
-    if let label = getAttr(element, kAXDescriptionAttribute) { return "label:\(label)" }
-    if let title = getAttr(element, kAXTitleAttribute) { return "title:\(title)" }
-    if let value = getAttr(element, kAXValueAttribute) { return "value:\(value)" }
+    if let value = readIdentifierLikeValue(element) { return value }
     return "<unknown>"
 }
 
@@ -94,6 +112,53 @@ func getLabel(_ element: AXUIElement) -> String {
 
 func elementHash(_ element: AXUIElement) -> Int {
     Int(CFHash(element))
+}
+
+func elementLoggingScore(_ element: AXUIElement) -> Int {
+    let role = getRole(element)
+    var score = 0
+
+    if let id = getAttr(element, kAXIdentifierAttribute), !id.isEmpty {
+        score += 12
+    }
+
+    if !getLabel(element).isEmpty {
+        score += role == (kAXWindowRole as String) ? 1 : 4
+    }
+
+    if !genericRoles.contains(role) {
+        score += 2
+    }
+
+    if role == (kAXWindowRole as String) {
+        score -= 3
+    }
+
+    return score
+}
+
+func bestElementForLogging(_ element: AXUIElement, maxParentHops: Int = 6) -> AXUIElement {
+    var best = element
+    var current = element
+    var bestScore = elementLoggingScore(element)
+    var seen = Set<Int>()
+
+    for _ in 0..<maxParentHops {
+        let currentHash = elementHash(current)
+        if seen.contains(currentHash) { break }
+        seen.insert(currentHash)
+
+        let currentScore = elementLoggingScore(current)
+        if currentScore > bestScore {
+            best = current
+            bestScore = currentScore
+        }
+
+        guard let parent = getAXElement(current, kAXParentAttribute) else { break }
+        current = parent
+    }
+
+    return best
 }
 
 func getCGPointAttr(_ element: AXUIElement, _ attr: String) -> CGPoint? {
@@ -142,11 +207,11 @@ func axPointCandidates(from point: CGPoint) -> [CGPoint] {
     return [point, flipped]
 }
 
-func elementAtPoint(_ appElement: AXUIElement, _ point: CGPoint) -> AXUIElement? {
+func elementAtPoint(_ rootElement: AXUIElement, _ point: CGPoint) -> AXUIElement? {
     for candidate in axPointCandidates(from: point) {
         var hitElement: AXUIElement?
         let result = AXUIElementCopyElementAtPosition(
-            appElement,
+            rootElement,
             Float(candidate.x),
             Float(candidate.y),
             &hitElement
@@ -246,9 +311,10 @@ func relatedElements(of element: AXUIElement) -> [AXUIElement] {
 }
 
 func logEvent(action: String, element: AXUIElement) {
-    let id = getIdentifier(element)
-    let role = getRole(element)
-    let label = getLabel(element)
+    let logElement = bestElementForLogging(element)
+    let id = getIdentifier(logElement)
+    let role = getRole(logElement)
+    let label = getLabel(logElement)
     let ts = timestamp()
     let signature = "\(action)|\(id)|\(role)|\(label)"
     if shouldDropAsDuplicate(signature) { return }
@@ -271,9 +337,9 @@ func logEvent(action: String, element: AXUIElement) {
     // Simulator dynamicznie podmienia poddrzewa AX. Doprofiluj subskrypcje
     // po każdym realnym zdarzeniu, żeby nie zgubić dalszych eventów.
     if let obs = observer {
-        _ = addNotification(obs, element, axPressedNotification)
-        _ = addNotification(obs, element, kAXValueChangedNotification as String)
-        for related in relatedElements(of: element) {
+        _ = addNotification(obs, logElement, axPressedNotification)
+        _ = addNotification(obs, logElement, kAXValueChangedNotification as String)
+        for related in relatedElements(of: logElement) {
             _ = addNotification(obs, related, axPressedNotification)
             _ = addNotification(obs, related, kAXValueChangedNotification as String)
         }
@@ -354,39 +420,127 @@ func subscribeRecursively(
     return (localVisited, localAdded)
 }
 
-func pollFallbackEvents(simulatorPID: pid_t, appElement: AXUIElement) {
-    // Kliknięcia: fallback, gdy AXPressed z Simulatora nie przychodzi.
-    let leftMouseDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
-    let simulatorFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == simulatorPID
-
-    if leftMouseDown && !leftMouseWasDown && simulatorFrontmost {
-        let mouse = NSEvent.mouseLocation
-        if isPointInsideSimulatorWindow(mouse, appElement: appElement) {
-            if let hit = elementAtPoint(appElement, mouse) {
-                logEvent(action: "tap", element: hit)
-            } else if let window = getCurrentWindow(appElement) {
-                logEvent(action: "tap", element: window)
-            }
-        }
+func choosePreferredFocusedElement(
+    appFocused: AXUIElement?,
+    systemFocused: AXUIElement?
+) -> AXUIElement? {
+    switch (appFocused, systemFocused) {
+    case let (.some(app), .some(system)):
+        let appScore = elementLoggingScore(bestElementForLogging(app))
+        let systemScore = elementLoggingScore(bestElementForLogging(system))
+        return systemScore >= appScore ? system : app
+    case let (.some(app), .none):
+        return app
+    case let (.none, .some(system)):
+        return system
+    default:
+        return nil
     }
-    leftMouseWasDown = leftMouseDown
+}
+
+func pollFallbackEvents(
+    simulatorPID: pid_t,
+    appElement: AXUIElement,
+    systemWideElement: AXUIElement
+) {
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == simulatorPID else { return }
+
+    // Backup detekcja kliknięcia, jeśli event tap chwilowo nie dostarczy eventu.
+    let leftMouseDown = CGEventSource.buttonState(.combinedSessionState, button: .left)
+    if leftMouseDown && !fallbackLeftMouseWasDown {
+        handleTapFallback(at: NSEvent.mouseLocation)
+    }
+    fallbackLeftMouseWasDown = leftMouseDown
+
+    let appFocused = getAXElement(appElement, kAXFocusedUIElementAttribute)
+    let systemFocused = getAXElement(systemWideElement, kAXFocusedUIElementAttribute)
+    let focused = choosePreferredFocusedElement(appFocused: appFocused, systemFocused: systemFocused)
 
     // Fokus/wartość: fallback, gdy notyfikacje fokusu i valueChange się gubią.
-    if let focused = getAXElement(appElement, kAXFocusedUIElementAttribute) {
-        let currentHash = elementHash(focused)
+    if let focused {
+        let focusLogElement = bestElementForLogging(focused)
+        let currentHash = elementHash(focusLogElement)
         if lastPolledFocusHash != currentHash {
             lastPolledFocusHash = currentHash
-            logEvent(action: "focus", element: focused)
+            logEvent(action: "focus", element: focusLogElement)
         }
 
         if let currentValue = getAttr(focused, kAXValueAttribute) {
-            let previousValue = lastPolledValueByElementHash[currentHash]
+            let valueKey = elementHash(focused)
+            let previousValue = lastPolledValueByElementHash[valueKey]
             if let previousValue, previousValue != currentValue {
                 logEvent(action: "valueChanged", element: focused)
             }
-            lastPolledValueByElementHash[currentHash] = currentValue
+            lastPolledValueByElementHash[valueKey] = currentValue
         }
     }
+}
+
+func handleTapFallback(at point: CGPoint) {
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == fallbackTapSimulatorPID else { return }
+    guard let appElement = fallbackTapAppElement,
+          let systemWideElement = fallbackTapSystemWideElement else { return }
+
+    if let hit = elementAtPoint(systemWideElement, point) ?? elementAtPoint(appElement, point) {
+        let hitRole = getRole(hit)
+        let hitId = getIdentifier(hit)
+        debugLog("tap hit role=\(hitRole) id=\(hitId)")
+        logEvent(action: "tap", element: hit)
+    } else {
+        let insideWindow = isPointInsideSimulatorWindow(point, appElement: appElement)
+        debugLog("tap miss (insideSimulatorWindow=\(insideWindow))")
+        if let window = getCurrentWindow(appElement) {
+            logEvent(action: "tap", element: window)
+        }
+    }
+}
+
+let tapEventCallback: CGEventTapCallBack = { _, type, event, _ in
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        if let tap = clickEventTap {
+            CGEvent.tapEnable(tap: tap, enable: true)
+            debugLog("CGEvent tap re-enabled")
+        }
+        return Unmanaged.passUnretained(event)
+    }
+
+    if type == .leftMouseDown {
+        handleTapFallback(at: event.location)
+    }
+
+    return Unmanaged.passUnretained(event)
+}
+
+func installTapFallbackEventTap(
+    simulatorPID: pid_t,
+    appElement: AXUIElement,
+    systemWideElement: AXUIElement
+) -> Bool {
+    fallbackTapSimulatorPID = simulatorPID
+    fallbackTapAppElement = appElement
+    fallbackTapSystemWideElement = systemWideElement
+
+    let eventMask = CGEventMask(1 << CGEventType.leftMouseDown.rawValue)
+    guard let tap = CGEvent.tapCreate(
+        tap: .cgSessionEventTap,
+        place: .headInsertEventTap,
+        options: .listenOnly,
+        eventsOfInterest: eventMask,
+        callback: tapEventCallback,
+        userInfo: nil
+    ) else {
+        return false
+    }
+
+    guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
+        return false
+    }
+
+    clickEventTap = tap
+    clickEventTapSource = source
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    return true
 }
 
 // MARK: - JSON export
@@ -484,6 +638,7 @@ if !trusted {
 // Utwórz observer
 let pid = simApp.processIdentifier
 let appElement = AXUIElementCreateApplication(pid)
+let systemWideElement = AXUIElementCreateSystemWide()
 
 let observerCreateResult = AXObserverCreate(pid, axCallback, &observer)
 if observerCreateResult != .success {
@@ -511,6 +666,16 @@ if !registrationErrors.isEmpty {
 
 CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(obs), .defaultMode)
 
+let installedTapFallback = installTapFallbackEventTap(
+    simulatorPID: pid,
+    appElement: appElement,
+    systemWideElement: systemWideElement
+)
+if !installedTapFallback {
+    print("⚠️  Nie udało się uruchomić monitoringu kliknięć (CGEvent tap).")
+    print("   Sprawdź też Privacy & Security → Input Monitoring dla terminala.")
+}
+
 // Simulator często dynamicznie tworzy/podmienia poddrzewa AX.
 // Okresowe dosubskrybowanie zapobiega "ciszy" po zmianie widoku.
 Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
@@ -523,7 +688,11 @@ Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
 
 // Fallback polling gdy Simulator nie emituje pełnego strumienia notyfikacji AX.
 Timer.scheduledTimer(withTimeInterval: fallbackPollInterval, repeats: true) { _ in
-    pollFallbackEvents(simulatorPID: pid, appElement: appElement)
+    pollFallbackEvents(
+        simulatorPID: pid,
+        appElement: appElement,
+        systemWideElement: systemWideElement
+    )
 }
 
 // Obsługa Ctrl+C
