@@ -1,8 +1,8 @@
 class AxRecorder < Formula
   desc "Record iOS Simulator UI interactions and export them as testID event logs"
   homepage "https://github.com/CodeLionApps/ax-recorder"
-  url "https://github.com/CodeLionApps/ax-recorder/releases/download/v0.1.7/ax-recorder-macos.tar.gz"
-  sha256 "720b5176e8a47ab7c0a1021df5235285bda58a5641614349d65df1a54e5d56a5"
+  url "https://github.com/CodeLionApps/ax-recorder/releases/download/v0.1.9/ax-recorder-macos.tar.gz"
+  sha256 "3824a713fbbdb899a6edeb0a5de9509a1271013c9e14767c00368308003ca32e"
   version "0.1.0"
   license "MIT"
 
